@@ -1,0 +1,149 @@
+import sys
+
+from datetime import datetime, timedelta
+from airflow.decorators import dag, task
+from airflow.operators.python import get_current_context
+
+import pandas as pd
+import pandahouse as ph
+
+import telegram
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import io
+import os
+
+
+default_args = {
+    'owner': 'v.shin',  # Владелец операции
+    'depends_on_past': False,  # Зависимость от прошлых запусков
+
+    'retries': 1,  # Кол-во попыток выполнить DAG
+    # 'retry_delay': timedelta(minutes=5), # Промежуток между перезапусками
+
+    'start_date': datetime(2023, 2, 16),  # Дата начала выполнения DAG
+    'end_date': datetime(2023, 3, 30),  # Дата завершения выполнения DAG
+}
+
+schedule_interval = timedelta(minutes=15)  # cron-выражение, также можно использовать '@daily', '@weekly', а также timedelta
+
+
+
+@dag(default_args=default_args, schedule_interval=schedule_interval, catchup=False)
+def shin_alert():
+    
+    @task()
+    def anomaly(data, metrics, a=3, n=3):
+    #Межквартильный размех. a - коэффицент изменения ширины интервала, n - временной интервал
+        data['q25'] = data[metrics].shift(1).rolling(n).quantile(0.25)
+        data['q75'] = data[metrics].shift(1).rolling(n).quantile(0.75)
+        data['iqr'] = data['q75'] - data['q25'] #межквартильный размах
+        data['up'] = data['q75'] + a*data['iqr'] #верхняя граница
+        data['low'] = data['q25'] - a*data['iqr'] #нижняя
+    
+        data['up'] = data['up'].rolling(n, center=True, min_periods=1).mean()
+        data['low'] = data['low'].rolling(n, center=True, min_periods=1).mean()
+    
+        if data[metrics].iloc[-1] > data['up'].iloc[-1] or data[metrics].iloc[-1] < data['low'].iloc[-1]:
+            is_alert = 1
+        else:
+            is_alert = 0
+        
+        return is_alert, data
+
+    @task()
+    def alert():
+        my_token = '' 
+        chat_id = -520311152
+        bot = telegram.Bot(token=my_token) 
+    
+        connection = {'host': 'https://clickhouse.lab.karpov.courses',
+                  'database': 'simulator_20230120',
+                  'user': 'student',
+                  'password': 'dpo_python_2020'
+                      }
+
+        q = ''' 
+            SELECT *
+            FROM
+             (
+                SELECT toStartOfInterval(time, INTERVAL 15 minute) AS interval,
+                 toStartOfDay(time) as day,
+                 formatDateTime(interval, '%R') as h_m, --преобразует дату-и-время в строку по заданному шаблону (R- час и минута)
+                count(DISTINCT user_id) AS active_users,
+                countIf(user_id, action = 'like')/countIf(user_id, action = 'view') as ctr,
+                countIf(user_id, action = 'like') as likes,
+                countIf(user_id, action = 'view') as views
+                from simulator_20230120.feed_actions
+                WHERE time >= today() - 1  and time < toStartOfFifteenMinutes(now())
+                GROUP BY interval,day,h_m
+                ORDER BY interval desc
+                ) t1
+            FULL OUTER JOIN
+                (
+                SELECT toStartOfInterval(time, INTERVAL 15 minute) AS interval,
+                toStartOfDay(time) as day,
+                formatDateTime(interval, '%R') as h_m,
+                count(DISTINCT user_id) AS active_users_feed,
+                count(reciever_id) AS messages_sent
+            FROM simulator_20230120.message_actions
+            WHERE time >= today() - 1 and time < toStartOfFifteenMinutes(now())
+            GROUP BY interval,day,h_m
+            ORDER BY interval desc
+          ) t2
+        USING(interval,day, h_m)
+        
+        '''
+
+        data = (ph.read_clickhouse(q, connection=connection))
+        metrics = ['views','likes','ctr','active_users','active_users_feed','messages_sent']
+    
+    
+        for metric in metrics:
+            print(metric)
+            data_2 = data[['interval','day','h_m',metric]].copy()
+            is_alert, data = anomaly(data, metric)
+        
+        
+            if is_alert == 1:
+                msg = """Метрика {metric}:\n текущее значение {curr_value:.3f}:\n отклонение от предыдущего значения {test_value:.3%}\nhttps://superset.lab.karpov.courses/superset/dashboard/2820/ """\
+            .format(metric = metric, curr_value = data[metric].iloc[-1], test_value = abs(1 -        data[metric].iloc[-1]/data[metric].iloc[-2]))
+
+
+        fig = plt.figure(figsize=(15, 10))
+        ax = sns.lineplot(data=data.sort_values(by=['day', 'h_m'], ascending = False), x = data['interval'], y = data[metric], label='metric')
+        ax = sns.lineplot(data = data.sort_values(by=['day', 'h_m'], ascending = False), x = data['interval'], y = data['up'], label='up')
+        ax = sns.lineplot(data = data.sort_values(by=['day', 'h_m'], ascending = False), x = data['interval'], y = data['low'], label='low')
+        ax = sns.lineplot(data=data.sort_values(by=['day', 'h_m'], ascending = False), x = data['interval'], y = data[metric], label='metric')
+
+        for ind, label in enumerate(ax.get_xticklabels()):
+            if ind % 5 == 0:
+                label.set_visible(True)
+            else:
+                label.set_visible(False)
+        ax.set(xlabel='time')
+        ax.set(ylabel=metric)
+
+        ax.set_title('{}'.format(metric)) # задае заголовок графика
+        ax.set(ylim=(0, None)) # задаем лимит для оси У
+            
+        plot_object = io.BytesIO()
+        plt.savefig(plot_object)
+        plot_object.seek(0)
+        plot_object.name = 'report.png'
+        plt.close()
+            
+        bot.sendPhoto(chat_id = chat_id, photo = plot_object)
+        bot.sendMessage(chat_id=chat_id, text=msg)
+
+            
+
+
+    @task()
+    def send_alert():
+        alert()
+        
+    send_alert()
+
+shin_alert = shin_alert() 
