@@ -1,0 +1,219 @@
+from datetime import datetime
+from airflow.decorators import dag, task
+from airflow.operators.python import get_current_context
+
+import pandas as pd
+import pandahouse as ph
+
+import telegram
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import io
+import os
+import json
+
+
+connection = {'host': 'https://clickhouse.lab.karpov.courses',
+              'database': 'simulator_20230120',
+              'user': 'student',
+              'password': 'dpo_python_2020'
+              }
+
+
+default_args = {
+    'owner': 'v.shin',  # Владелец операции
+    'depends_on_past': False,  # Зависимость от прошлых запусков
+
+    'retries': 1,  # Кол-во попыток выполнить DAG
+    # 'retry_delay': timedelta(minutes=5), # Промежуток между перезапусками
+
+    'start_date': datetime(2023, 2, 2),  # Дата начала выполнения DAG
+    'end_date': datetime(2023, 2, 28),  # Дата завершения выполнения DAG
+}
+
+schedule_interval = '0 11 * * *'  # cron-выражение, также можно использовать '@daily', '@weekly', а также timedelta
+
+
+my_token = '' 
+bot = telegram.Bot(token=my_token) # получаем доступ
+
+chat_id = '-677113209'
+
+@dag(default_args=default_args, schedule_interval=schedule_interval, catchup=False)
+def dag_v_shin_report():
+    #выгружаем данные для отправки сообщения
+    @task()
+    def extract_mess():
+        q = ''' SELECT toStartOfDay(toDateTime(time)) AS __timestamp,
+       count(DISTINCT user_id) AS "DAU",
+       countIf(action, action = 'view') AS "views",
+       countIf(action, action = 'like') AS "likes", 
+       countIf(user_id, action='like') / countIf(user_id, action='view') AS "ctr"
+        FROM simulator_20230120.feed_actions
+        where toStartOfDay(toDateTime(time)) = today() - 1
+        GROUP BY toStartOfDay(toDateTime(time))'''
+        data_mess = ph.read_clickhouse(q, connection=connection)
+
+        return data_mess 
+    
+    @task()
+    def sending(chat_id, data_mess):
+        msg = f"{'Отчет за вчера'} {': DAU'} - {data_mess['DAU'][0]}, {'views'} - {data_mess['views'][0]}, {'likes'} - {data_mess['likes'][0]}, {'ctr'} - {data_mess['ctr'][0]} "
+        bot.sendMessage(chat_id=chat_id, text=msg)
+    
+    @task()
+    def extract_lineplot():
+        q2 = ''' 
+        SELECT toStartOfDay(toDateTime(time)) AS dt,
+        count(DISTINCT user_id) AS "DAU",
+        countIf(action, action = 'view') AS "views",
+        countIf(action, action = 'like') AS "likes", 
+        countIf(user_id, action='like') / countIf(user_id, action='view') AS "ctr"
+        FROM simulator_20230120.feed_actions
+        where toStartOfDay(toDateTime(time)) >= today() - 7
+        GROUP BY toStartOfDay(toDateTime(time))
+        order by dt
+        '''
+
+        data_2 = (ph.read_clickhouse(q2, connection=connection))
+        return data_2
+    
+    @task
+    def graph(data_2):
+        
+        fig = plt.figure(figsize=(20, 10))
+
+        # DAU
+        plt.subplot(221)
+        x = data_2['dt']
+        y = data_2['DAU']
+        sns.lineplot(x, y)
+        plt.title('DAU')
+
+        # Views
+        plt.subplot(222)
+        x = data_2['dt']
+        y = data_2['views']
+        sns.lineplot(x, y)
+        plt.title('views')
+
+        # Likes
+        plt.subplot(223)
+        x = data_2['dt']
+        y = data_2['likes']
+        sns.lineplot(x, y)
+        plt.title('likes')
+
+        #ctr
+        plt.subplot(224)
+        x = data_2['dt']
+        y = data_2['ctr']
+        sns.lineplot(x, y)
+        plt.title('ctr')
+
+        plot_object = io.BytesIO()
+        plt.savefig(plot_object)
+        plot_object.seek(0)
+        plot_object.name = 'report.png'
+        plt.close()
+        bot.sendPhoto(chat_id = chat_id, photo = plot_object)
+        
+        
+    @task()
+    def extract_source():
+        q3 = '''
+            SELECT source, uniq(user_id) as uniq_user, toDate(time) as dt
+        from simulator_20230120.feed_actions
+        where dt >= today() - 7
+        GROUP BY source, dt
+        order by dt
+        '''
+
+        data_sourses = ph.read_clickhouse(q3, connection=connection)
+        return data_sourses
+    
+    @task()
+    def send_gr_sources(data_sourses): 
+        
+        plt.tick_params(axis='x', rotation=20)
+
+         # source график
+        sns.lineplot(data = data_sourses, x = 'dt', y = 'uniq_user', hue = 'source')
+        plt.title('number of uniq.users by channels for the last week')
+        plot_object = io.BytesIO()
+        plt.savefig(plot_object)
+        plot_object.seek(0)
+        plot_object.name = 'report.png'
+        plt.close()
+        bot.sendPhoto(chat_id = chat_id, photo = plot_object)
+        
+    
+    @task()
+    def extract_act():
+        q4 = '''
+            SELECT count(action) as act, toDate(time) as dt
+            from simulator_20230120.feed_actions
+            where dt >= today() - 7
+            GROUP BY dt
+            '''
+
+        data_act = ph.read_clickhouse(q4, connection=connection)
+        return data_act
+        
+    @task()
+    def send_actions(data_act):
+        plt.tick_params(axis='x', rotation=20)
+
+         # act график
+        sns.lineplot(data = data_act, x = 'dt', y = 'act')
+        plt.title('all actions for the week')
+        plot_object = io.BytesIO()
+        plt.savefig(plot_object)
+        plot_object.seek(0)
+        plot_object.name = 'report.png'
+        plt.close()
+        bot.sendPhoto(chat_id = chat_id, photo = plot_object)
+
+    @task()
+    def extract_os():
+        q5 = '''
+        select toDate(time) as dt, user_id, reciever_id, os
+        from simulator_20230120.message_actions
+        where toDate(time) >= today() - 7
+        '''
+        data_os = ph.read_clickhouse(q5, connection=connection)
+        data_os= data_os.groupby(['dt', 'os']).agg({'user_id':'count'})
+        return data_os
+    @task()
+    def send_os(data_os):
+        # message график
+        plt.tick_params(axis='x', rotation=20)
+        sns.lineplot(data = data_os, x = 'dt', y = 'user_id', hue = 'os')
+        plt.title('messages for the week by os')
+        plot_object = io.BytesIO()
+        plt.savefig(plot_object)
+        plot_object.seek(0)
+        plot_object.name = 'report.png'
+        plt.close()
+        bot.sendPhoto(chat_id = chat_id, photo = plot_object)
+
+    
+    
+    data = extract_mess()
+    send_message = sending(chat_id, data)
+    
+    data_2 = extract_lineplot()
+    send_graph = graph(data_2) 
+    
+    data_3 = extract_source()
+    send_gr_sources = send_gr_sources(data_3)
+    
+    data_4 = extract_act()
+    send_act = send_actions(data_4)
+    
+    data_5 = extract_os()
+    send_os = send_os(data_5)
+    
+        
+dag_v_shin_report = dag_v_shin_report()
